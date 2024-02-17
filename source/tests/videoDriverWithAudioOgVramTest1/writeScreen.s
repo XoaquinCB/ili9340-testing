@@ -1,34 +1,17 @@
-#include <avr/io.h>
-
-; #define DATA_PORT PORTD
-; #define CONTROL_PORT PORTB
-#define DATA_PORT PORTC
-#define CONTROL_PORT PORTA
-#define CONTROL_PORT_CSX 0
-#define CONTROL_PORT_D_CX 4
-#define CONTROL_PORT_VSYNC 6
-
-#define IO(io_reg) _SFR_IO_ADDR(io_reg)
-
 .global writeScreen
-
 .section .text
 
-;############################################## Write all tiles to screen ##############################################
-;### void writeScreen(void)
-;###
+;############################################### void writeScreen(void) ################################################
 ;### C-callable
 ;###############
 
 writeScreen:
 
-    ; ERROR: these values need recalculating
+    ; Total execution time (TILE_WIDTH = 6) = 18+13+17+289079+30 = 289157 CPU cycles
+    ; Total execution time (TILE_WIDTH = 8) = 18+13+17+270569+30 = 270647 CPU cycles
     ;
-    ; Total execution time (TILE_WIDTH = 6) = 45 + 40*(33 + 4*64*28 + 5) - 1 + 16 = 288300 CPU cycles
-    ; Total execution time (TILE_WIDTH = 8) = 45 + 30*(33 + 4*80*28 + 5) - 1 + 16 = 270000 CPU cycles
-    ;
-    ; Code size (TILE_WIDTH = 6) = 200 bytes
-    ; Code size (TILE_WIDTH = 8) = 206 bytes
+    ; Code size (TILE_WIDTH = 6) = 20+26+30+226+32 = 334 bytes of FLASH
+    ; Code size (TILE_WIDTH = 8) = 20+26+30+254+32 = 362 bytes of FLASH
     ;
     ; - There are two dimensions allowed for tiles: 6x8 pixels and 8x8 pixels.
     ; - The original Uzebox pixels aren't square, but instead have an aspect ratio of 4:3, which could be achieved because it uses the analogue NTSC display format.
@@ -58,332 +41,421 @@ writeScreen:
     ; one CPU cycle later will toggle OC0A once. Adding an odd number of extra CPU cycles in between enabling and disabling
     ; will toggle OC0A an even number of times, leaving it in its original state after.
 
+    #include <avr/io.h>
+
+    #define IO(io_reg) _SFR_IO_ADDR(io_reg)
+
+    #define DATA_PORT PORTC
+    #define CONTROL_PORT PORTA
+    #define CONTROL_PORT_CSX 0
+    #define CONTROL_PORT_D_CX 4
+    #define CONTROL_PORT_VSYNC 6
+
+    #define reg_sregSave r0
+    #define reg_zero r1
+    #define reg_timerEnable r12
+    #define reg_timerDisable r13
+    #define reg_nextTile_l r14
+    #define reg_nextTile_h r15
+    #define reg_columnsRemaining r16
+    #define reg_temporary r17
+    #define reg_pixelOuterLoopCounter r18
+    #define reg_pixelInnerLoopCounter r19
+    #define reg_tilesRemainingInColumn r20
+    #define reg_nextPixel r21
+    #define reg_startColumn_l r22
+    #define reg_startColumn_h r23
+    #define reg_endColumn_l r24
+    #define reg_endColumn_h r25
+
+    #if TILE_WIDTH == 6
+        #define FIRST_SC 0
+        #define FIRST_EC 7
+        #define COLUMN_COUNT 40
+        #define ACTUAL_TILE_WIDTH 8
+    #elif TILE_WIDTH == 8
+        #define FIRST_SC 10
+        #define FIRST_EC 19
+        #define COLUMN_COUNT 30
+        #define ACTUAL_TILE_WIDTH 10
+    #else
+        #error "TILE_WIDTH must be 6 or 8"
+    #endif
+
     ;##################################################### Set up ######################################################
+    ; 18 CPU cycles
+    ; 20 bytes of FLASH
 
         ; Push call-save registers that will be modified, so they can be restored later:
-        push r13                                       ; (H-H)
-        push r14                                       ; (H-H)
-        push r15                                       ; (H-H)
-        push r16                                       ; (H-H)
-        push r17                                       ; (H-H)
-        push YL                                        ; (H-H)
-        push YH                                        ; (H-H)
+        push r12                                            ; (H-H)
+        push r13                                            ; (H-H)
+        push r14                                            ; (H-H)
+        push r15                                            ; (H-H)
+        push r16                                            ; (H-H)
+        push r17                                            ; (H-H)
+        push YL                                             ; (H-H)
+        push YH                                             ; (H-H)
 
-        ; Save SREG (to restore it later) and disable interrupts:
-        in r0, IO(SREG)                                ; (H)
-        cli                                            ; (H)
+        ; Save SREG (to restore global interrupts flag later) and disable interrupts:
+        in reg_sregSave, IO(SREG)                           ; (H)
+        cli                                                 ; (H)
 
-        ; TODO: Should VSYNC be generated after sending the data instead of before? This is not how the datasheet says to
-        ;       do it but, if it works, it would ensure the scan line doesn't overtake the memory writing.
-        ; Generate a negative pulse on VSYNC signal:
-        cbi IO(CONTROL_PORT), CONTROL_PORT_VSYNC       ; (H-H)
-        sbi IO(CONTROL_PORT), CONTROL_PORT_VSYNC       ; (H-H)
-
-        ; Pull CSX line low:
-        cbi IO(CONTROL_PORT), CONTROL_PORT_CSX         ; (H-H)
-
-    ;~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    ;~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ Set up ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
     ;############################################### Initialise variables ##############################################
+    ; 13 CPU cycles
+    ; 26 bytes of FLASH
 
-        ldi r18, (1 << WGM02) | (1 << CS00)            ; (H) TCCR0B value to enable timer
-        ldi r19, (1 << WGM02)                          ; (H) TCCR0B value to disable timer
-        movw r14, r18                                  ; (H) move values to r14 and r15
+        ldi reg_temporary, (1 << WGM02) | (1 << CS00)       ; (H) TCCR0B value to enable timer
+        mov reg_timerEnable, reg_temporary                  ; (H) Move to correct register (can't 'ldi' directly to that register)
+        ldi reg_temporary, (1 << WGM02)                     ; (H) TCCR0B value to disable timer
+        mov reg_timerDisable, reg_temporary                 ; (H) Move to correct register (can't 'ldi' directly to that register)
 
-        #if TILE_WIDTH == 6
-            ldi r18, 0                                 ; (H) start-column low byte
-            ldi r19, 0                                 ; (H) start-column high byte
-            ldi r24, 7                                 ; (H) end-column low byte
-            ldi r25, 0                                 ; (H) end-column high byte
-            ldi r22, 40                                ; (H) columns remaining
-        #elif TILE_WIDTH == 8
-            ldi r18, 10                                ; (H) start-column low byte
-            ldi r19, 0                                 ; (H) start-column high byte
-            ldi r24, 19                                ; (H) end-column low byte
-            ldi r25, 0                                 ; (H) end-column high byte
-            ldi r22, 30                                ; (H) columns remaining
-        #else
-            #error "TILE_WIDTH must be 6 or 8"
-        #endif
+        ldi reg_startColumn_l, lo8(FIRST_SC)                ; (H) start-column low byte
+        ldi reg_startColumn_h, hi8(FIRST_SC)                ; (H) start-column high byte
+        ldi reg_endColumn_l, lo8(FIRST_EC)                  ; (H) end-column low byte
+        ldi reg_endColumn_h, hi8(FIRST_EC)                  ; (H) end-column high byte
+        ldi reg_columnsRemaining, COLUMN_COUNT              ; (H) columns remaining
 
-        ldi XL, lo8(vram)                              ; (H) Load VRAM address into X register (low byte)
-        ldi XH, hi8(vram)                              ; (H) Load VRAM address into X register (high byte)
-        ld ZL, X+                                      ; (H) Read first tile pointer from VRAM into Z register (low byte)
-        ld ZH, X+                                      ; (H) Read first tile pointer from VRAM into Z register (high byte)
+        lds XL, currentAudioSamplePtr                       ; (H-H) Load address of current audio sample into X register (low byte)
+        lds XH, currentAudioSamplePtr+1                     ; (H-H) Load address of current audio sample into X register (high byte)
 
-        lds YL, currentAudioSamplePtr                     ; (H) Load address of next audio sample into Y register (low byte)
-        lds YH, currentAudioSamplePtr+1                   ; (H) Load address of next audio sample into Y register (high byte)
-
-    ;~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    ;~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ Initialise variables ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
     ;####################################### Write PASET command and parameters ########################################
+    ; 17 CPU cycles
+    ; 30 bytes of FLASH
 
         ; Set data/command signal low (command):
-        cbi IO(CONTROL_PORT), CONTROL_PORT_D_CX        ; (H-H)
+        cbi IO(CONTROL_PORT), CONTROL_PORT_D_CX             ; (H-H)
 
         ; Write PASET command code to LCD:
-        ldi r23, 0x2B                                  ; (H) Put PASET command code into register
-        out IO(TCCR0B), r14                            ; (H) Enable timer
-        out IO(DATA_PORT), r23                         ; (L) Write command code to data port
-        out IO(TCCR0B), r15                            ; (H) Disable timer
+        ldi reg_temporary, 0x2B                             ; (H) Put PASET command code into register
+        out IO(TCCR0B), reg_timerEnable                     ; (H) Enable timer
+        out IO(DATA_PORT), reg_temporary                    ; (L) Write command code to data port
+        out IO(TCCR0B), reg_timerDisable                    ; (H) Disable timer
 
         ; Set data/command signal high (data)
-        sbi IO(CONTROL_PORT), CONTROL_PORT_D_CX        ; (H-H)
+        sbi IO(CONTROL_PORT), CONTROL_PORT_D_CX             ; (H-H)
 
         ; Write PASET parameters (start-page and end-page):
-        out IO(TCCR0B), r14                            ; (H) Enable timer
-        out IO(DATA_PORT), r1                          ; (L) Write start-page high byte (zero) to data port
-        ldi r23, 7                                     ; (H) Put start-page low byte into a register
-        out IO(DATA_PORT), r23                         ; (L) Write start-page low byte to data port
-        nop                                            ; (H) Synchronisation delay
-        out IO(DATA_PORT), r1                          ; (L) Write end-page high byte (zero) to data port
-        ldi r23, 230                                   ; (H) Put end-page low byte into a register
-        out IO(DATA_PORT), r23                         ; (L) Write end-page low byte to data port
-        out IO(TCCR0B), r15                            ; (H) Disable timer
+        out IO(TCCR0B), reg_timerEnable                     ; (H) Enable timer
+        out IO(DATA_PORT), reg_zero                         ; (L) Write start-page high byte (zero) to data port
+        ldi reg_temporary, 7                                ; (H) Put start-page low byte into a register
+        out IO(DATA_PORT), reg_temporary                    ; (L) Write start-page low byte to data port
+        nop                                                 ; (H) Synchronisation delay
+        out IO(DATA_PORT), reg_zero                         ; (L) Write end-page high byte (zero) to data port
+        ldi reg_temporary, 230                              ; (H) Put end-page low byte into a register
+        out IO(DATA_PORT), reg_temporary                    ; (L) Write end-page low byte to data port
+        out IO(TCCR0B), reg_timerDisable                    ; (H) Disable timer
 
-    ;~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    ;~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ Write PASET command and parameters ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-    ;################################################ Write tile column ################################################
+    ;###################################### Column loop (executed 40 or 30 times) ######################################
+    ; (19+8+7184+16)*40-1 = 289079 CPU cycles (TILE_WIDTH = 6)
+    ; (19+8+8976+16)*30-1 = 270569 CPU cycles (TILE_WIDTH = 8)
+    ; 32+12+156+26 = 226 bytes of FLASH (TILE_WIDTH = 6)
+    ; 32+12+184+26 = 254 bytes of FLASH (TILE_WIDTH = 8)
 
-    write_tile_column:
+    tileColumnLoop:
 
         ;##################################### Write CASET command and parameters ######################################
+        ; 19 CPU cycles
+        ; 32 bytes of FLASH
 
             ; Set data/command signal low (command):
-            cbi IO(CONTROL_PORT), CONTROL_PORT_D_CX    ; (H-H)
+            cbi IO(CONTROL_PORT), CONTROL_PORT_D_CX         ; (H-H)
 
             ; Write CASET command code to LCD:
-            ldi r23, 0x2A                              ; (H) Put CASET command code into register
-            out IO(TCCR0B), r14                        ; (H) Enable timer
-            out IO(DATA_PORT), r23                     ; (L) Write command code to data port
-            out IO(TCCR0B), r15                        ; (H) Disable timer
+            ldi reg_temporary, 0x2A                         ; (H) Put CASET command code into register
+            out IO(TCCR0B), reg_timerEnable                 ; (H) Enable timer
+            out IO(DATA_PORT), reg_temporary                ; (L) Write command code to data port
+            out IO(TCCR0B), reg_timerDisable                ; (H) Disable timer
 
             ; Set data/command signal high (data)
-            sbi IO(CONTROL_PORT), CONTROL_PORT_D_CX    ; (H-H)
+            sbi IO(CONTROL_PORT), CONTROL_PORT_D_CX         ; (H-H)
 
-            ; Write CASET parameters (start-page and end-page):
-            out IO(TCCR0B), r14                        ; (H) Enable timer
-            out IO(DATA_PORT), r19                     ; (L) Write start-column high byte to data port
-            nop                                        ; (H) Synchronisation delay
-            out IO(DATA_PORT), r18                     ; (L) Write start-column low byte to data port
-            #if TILE_WIDTH == 6
-                subi r18, -8                           ; (H) Add 8 to start-column low byte
-            #elif TILE_WIDTH == 8
-                subi r18, -10                          ; (H) Add 10 to start-column low byte
-            #else
-                #error "TILE_WIDTH must be 6 or 8"
-            #endif
-            out IO(DATA_PORT), r25                     ; (L) Write end-column high byte to data port
-            sbci r19, 0xFF                             ; (H) Propogate carry to start-column high byte
-            out IO(DATA_PORT), r24                     ; (L) Write end-column low byte to data port
-            out IO(TCCR0B), r15                        ; (H) Disable timer
-            #if TILE_WIDTH == 6
-                adiw r24, 8                            ; (H-H) Add 8 to end-column
-            #elif TILE_WIDTH == 8
-                adiw r24, 10                           ; (H-H) Add 10 to end-colmn
-            #else
-                #error "TILE_WIDTH must be 6 or 8"
-            #endif
+            ; Write CASET parameters (start-column and end-column):
+            out IO(TCCR0B), reg_timerEnable                 ; (H) Enable timer
+            out IO(DATA_PORT), reg_startColumn_h            ; (L) Write start-column high byte to data port
+            nop                                             ; (H) Synchronisation delay
+            out IO(DATA_PORT), reg_startColumn_l            ; (L) Write start-column low byte to data port
+            subi reg_startColumn_l, -ACTUAL_TILE_WIDTH      ; (H) Increment start-column low byte
+            out IO(DATA_PORT), reg_endColumn_h              ; (L) Write end-column high byte to data port
+            sbci reg_startColumn_h, 0xFF                    ; (H) Propogate carry to start-column high byte
+            out IO(DATA_PORT), reg_endColumn_l              ; (L) Write end-column low byte to data port
+            out IO(TCCR0B), reg_timerDisable                ; (H) Disable timer
+            adiw reg_endColumn_l, ACTUAL_TILE_WIDTH         ; (H-H) Increment to end-column
 
-        ;~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        ;~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ Write CASET command and parameters ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
         ;############################################# Write RAMWR command #############################################
+        ; 8 CPU cycles
+        ; 12 bytes of FLASH
 
             ; Set data/command signal low (command)
-            cbi IO(CONTROL_PORT), CONTROL_PORT_D_CX    ; (H-H)
+            cbi IO(CONTROL_PORT), CONTROL_PORT_D_CX         ; (H-H)
 
             ; Write RAMWR command code to LCD
-            ldi r23, 0x2C                              ; (H) Put RAMWR command code into register
-            out IO(TCCR0B), r14                        ; (H) Enable timer
-            out IO(DATA_PORT), r23                     ; (L) Write command code to LCD
-            out IO(TCCR0B), r15                        ; (H) Disable timer
+            ldi reg_temporary, 0x2C                         ; (H) Put RAMWR command code into register
+            out IO(TCCR0B), reg_timerEnable                 ; (H) Enable timer
+            out IO(DATA_PORT), reg_temporary                ; (L) Write command code to LCD
+            out IO(TCCR0B), reg_timerDisable                ; (H) Disable timer
 
             ; Set data/command signal high (data)
-            sbi IO(CONTROL_PORT), CONTROL_PORT_D_CX    ; (H-H)
+            sbi IO(CONTROL_PORT), CONTROL_PORT_D_CX         ; (H-H)
 
-        ;~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        ;~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ Write RAMWR command ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
         ;############################# Write all tiles in the column (as RAMWR parameters) #############################
+        ; 17+7167 = 7184 CPU cycles (TILE_WIDTH = 6)
+        ; 17+8959 = 8976 CPU cycles (TILE_WIDTH = 8)
+        ; 26+130 = 156 bytes of FLASH (TILE_WIDTH = 6)
+        ; 26+158 = 184 bytes of FLASH (TILE_WIDTH = 8)
 
-            ; Initialise loop variables
-            ldi r16, 4                                 ; (H) Counter for pixel_loop_1
-            ldi r17, 28
-            mov r13, r17                               ; (H) Tiles remaining in column
+            ;########################################## Initialise tile loop ###########################################
+            ; 17 CPU cycles
+            ; 26 bytes of FLASH
 
-            ; Read first pixel from FLASH
-            lpm r23, Z+                                ; (H-H-H)
+                ; Initialise loop variables
+                ldi reg_pixelOuterLoopCounter, 2            ; (H) Counter for pixel_outer_loop
+                ldi reg_pixelInnerLoopCounter, 3            ; (H) Counter for pixel_inner_loop
+                ldi reg_tilesRemainingInColumn, 28          ; (H) Tiles remaining in column
 
-            ; Enable timer:
-            out IO(TCCR0B), r14                        ; (H)
+                ; Load first tile pointer in the column into Y register:
+                ldi YL, COLUMN_COUNT                        ; (H)
+                sub YL, reg_columnsRemaining                ; (H)
+                lsl YL                                      ; (H)
+                ldi YH, 0                                   ; (H)
+                subi YL, lo8(-(vram))                       ; (H)
+                sbci YH, hi8(-(vram))                       ; (H)
 
-        write_tile:
+                ; Load the first tile texture pointer into Z register:
+                ldd ZL, Y+0                                 ; (H-H) Read first tile texture pointer from VRAM into Z register (low byte)
+                ldd ZH, Y+1                                 ; (H-H) Read first tile texture pointer from VRAM into Z register (high byte)
 
-            ;######################## Write first 48 or 60 (out of 64 or 80) pixels of the tile ########################
+                ; Read first pixel from FLASH
+                lpm reg_nextPixel, Z+                       ; (H-H-H)
 
-            pixel_loop_1:
+                ; Enable timer:
+                out IO(TCCR0B), reg_timerEnable             ; (H)
 
-                ; Write 4 or 5 pixels and increment audio sample pointer if TIMER1 interrupt flag is set:
+            ;~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ Initialise tile loop ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+            ;###################################### Tile loop (executed 28 times) ######################################
+            ; 16*16*28-1 = 7167 CPU cycles (TILE_WIDTH = 6)
+            ; 20*16*28-1 = 8959 CPU cycles (TILE_WIDTH = 8)
+            ;  94+36 = 130 bytes of FLASH (TILE_WIDTH = 6)
+            ; 114+44 = 158 bytes of FLASH (TILE_WIDTH = 8)
+
+            tileLoop:
+
+                ;################################# Pixel outer loop (executed 2 times) #################################
+                ; 16*7*2 = 224 CPU cycles (TILE_WIDTH = 6)
+                ; 20*7*2 = 280 CPU cycles (TILE_WIDTH = 8)
+                ; 20+72 =  94 bytes of FLASH (TILE_WIDTH = 6)
+                ; 24+88 = 114 bytes of FLASH (TILE_WIDTH = 8)
+
+                pixelOuterLoop:
+
+                    ;############################### Pixel inner loop (executed 3 times) ###############################
+                    ; 16*3 = 48 CPU cycles (TILE_WIDTH = 6)
+                    ; 20*3 = 60 CPU cycles (TILE_WIDTH = 8)
+                    ; 20 bytes of FLASH (TILE_WIDTH = 6)
+                    ; 24 bytes of FLASH (TILE_WIDTH = 8)
+
+                    pixelInnerLoop:
+
+                        ; Write 4 or 5 pixels, and read TIMER1 interupt flag register, and loop:
+
+                        #if TILE_WIDTH == 8
+                            out IO(DATA_PORT), reg_nextPixel; (L) Write pixel to data port
+                            lpm reg_nextPixel, Z+           ; (H-L-H) Read next pixel from FLASH
+                        #endif
+                        out IO(DATA_PORT), reg_nextPixel    ; (L) Write pixel to data port
+                        lpm reg_nextPixel, Z+               ; (H-L-H) Read next pixel from FLASH
+                        out IO(DATA_PORT), reg_nextPixel    ; (L) Write pixel to data port
+                        lpm reg_nextPixel, Z+               ; (H-L-H) Read next pixel from FLASH
+                        out IO(DATA_PORT), reg_nextPixel    ; (L) Write pixel to data port
+                        lpm reg_nextPixel, Z+               ; (H-L-H) Read next pixel from FLASH
+
+                        in reg_temporary, IO(TIFR1)         ; (L) Read TIMER1 interrupt flag register
+                        dec reg_pixelInnerLoopCounter       ; (H) Decrement pixel_inner_loop counter
+                        brne pixelInnerLoop                 ; (L-H / L) If counter hasn't reached zero, loop again
+                        ldi reg_pixelInnerLoopCounter, 3    ; (H) Reset pixel_inner_loop counter for next time
+
+                    ;~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ Pixel inner loop (executed 3 times) ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+                    ; Write 4 or 5 pixels, and increment audio sample pointer if TIMER1 has overflown:
+
+                    #if TILE_WIDTH == 8
+                        out IO(DATA_PORT), reg_nextPixel    ; (L) Write pixel to data port
+                        lpm reg_nextPixel, Z+               ; (H-L-H) Read next pixel from FLASH
+                    #endif
+                    out IO(DATA_PORT), reg_nextPixel        ; (L) Write pixel to data port
+                    lpm reg_nextPixel, Z+                   ; (H-L-H) Read next pixel from FLASH
+                    out IO(DATA_PORT), reg_nextPixel        ; (L) Write pixel to data port
+                    lpm reg_nextPixel, Z+                   ; (H-L-H) Read next pixel from FLASH
+                    out IO(DATA_PORT), reg_nextPixel        ; (L) Write pixel to data port
+                    lpm reg_nextPixel, Z+                   ; (H-L-H) Read next pixel from FLASH
+
+                    andi reg_temporary, (1 << TOV1)         ; (H) Mask TOV1 (timer overflow) flag
+                    out IO(TIFR1), reg_temporary            ; (L) If the flag was set, clear it
+                    add XL, reg_temporary                   ; (H) If the flag was set, add 1 to sample pointer (carry is propogated to high byte later)
+                    adc XH, reg_zero                        ; (L) Propogate carry to sample pointer high byte
+
+                    ; Write 4 or 5 pixels, and write the current audio sample to the PWM channel:
+
+                    #if TILE_WIDTH == 8
+                        out IO(DATA_PORT), reg_nextPixel    ; (L) Write pixel to data port
+                        lpm reg_nextPixel, Z+               ; (H-L-H) Read next pixel from FLASH
+                    #endif
+                    out IO(DATA_PORT), reg_nextPixel        ; (L) Write pixel to data port
+                    lpm reg_nextPixel, Z+                   ; (H-L-H) Read next pixel from FLASH
+                    out IO(DATA_PORT), reg_nextPixel        ; (L) Write pixel to data port
+                    lpm reg_nextPixel, Z+                   ; (H-L-H) Read next pixel from FLASH
+                    out IO(DATA_PORT), reg_nextPixel        ; (L) Write pixel to data port
+                    lpm reg_nextPixel, Z+                   ; (H-L-H) Read next pixel from FLASH
+
+                    ld reg_temporary, X                     ; (H-L) Read sample from audio buffer
+                    sts OCR2A, reg_temporary                ; (H-L) Store sample to PWM channel
+
+                    ; Write 4 or 5 pixels, and increment tile pointer:
+
+                    #if TILE_WIDTH == 8
+                        out IO(DATA_PORT), reg_nextPixel    ; (L) Write pixel to data port
+                        lpm reg_nextPixel, Z+               ; (H-L-H) Read next pixel from FLASH
+                    #endif
+                    out IO(DATA_PORT), reg_nextPixel        ; (L) Write pixel to data port
+                    lpm reg_nextPixel, Z+                   ; (H-L-H) Read next pixel from FLASH
+                    out IO(DATA_PORT), reg_nextPixel        ; (L) Write pixel to data port
+                    lpm reg_nextPixel, Z+                   ; (H-L-H) Read next pixel from FLASH
+                    out IO(DATA_PORT), reg_nextPixel        ; (L) Write pixel to data port
+                    lpm reg_nextPixel, Z+                   ; (H-L-H) Read next pixel from FLASH
+
+                    adiw YL, COLUMN_COUNT                   ; (L-H) Add 40 to tile pointer. This happens twice per tile so a total of 80 is added.
+                    ldd reg_nextTile_l, Y+0                 ; (L-H) Read next tile pointer into register pair r21:r20 (low byte)
+
+                    ; Write 4 or 5 pixels, and loop:
+
+                    #if TILE_WIDTH == 8
+                        out IO(DATA_PORT), reg_nextPixel    ; (L) Write pixel to data port
+                        lpm reg_nextPixel, Z+               ; (H-L-H) Read next pixel from FLASH
+                    #endif
+                    out IO(DATA_PORT), reg_nextPixel        ; (L) Write pixel to data port
+                    lpm reg_nextPixel, Z+                   ; (H-L-H) Read next pixel from FLASH
+                    out IO(DATA_PORT), reg_nextPixel        ; (L) Write pixel to data port
+                    lpm reg_nextPixel, Z+                   ; (H-L-H) Read next pixel from FLASH
+                    out IO(DATA_PORT), reg_nextPixel        ; (L) Write pixel to data port
+                    lpm reg_nextPixel, Z+                   ; (H-L-H) Read next pixel from FLASH
+
+                    nop                                     ; (L) Synchronisation delay
+                    dec reg_pixelOuterLoopCounter           ; (H) Decrement pixel_outer_loop counter
+                    brne pixelOuterLoop                     ; (L-H / L) If counter hasn't reached zero, loop again
+                    ldi reg_pixelOuterLoopCounter, 2        ; (H) Reset pixel_outer_loop counter for next time
+
+                ;~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ Pixel outer loop (executed 2 times) ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+                ; Write 4 or 5 pixels, read the tile texture pointer, and decrement tile counter:
+
                 #if TILE_WIDTH == 8
-                    out IO(DATA_PORT), r23                 ; (L) Write pixel to data port
-                    lpm r23, Z+                            ; (H-L-H) Read next pixel from FLASH
+                    out IO(DATA_PORT), reg_nextPixel        ; (L) Write pixel to data port
+                    lpm reg_nextPixel, Z+                   ; (H-L-H) Read next pixel from FLASH
                 #endif
-                out IO(DATA_PORT), r23                     ; (L) Write pixel to data port
-                lpm r23, Z+                                ; (H-L-H) Read next pixel from FLASH
-                out IO(DATA_PORT), r23                     ; (L) Write pixel to data port
-                lpm r23, Z+                                ; (H-L-H) Read next pixel from FLASH
-                out IO(DATA_PORT), r23                     ; (L) Write pixel to data port
-                in r23, IO(TIFR1)                          ; (H) Read TIMER1 interrupt flag register
-                andi r23, (1 << TOV1)                      ; (L) Mask TOV1 flag
-                out IO(TIFR1), r23                         ; (H) If the flag was set, clear it
-                add YL, r23                                ; (L) If the flag was set, add 1 to Y register (audio sample pointer) (carry is propogated to high byte after)
-                lpm r23, Z+                                ; (H-L-H) Read next pixel from FLASH
+                out IO(DATA_PORT), reg_nextPixel            ; (L) Write pixel to data port
+                lpm reg_nextPixel, Z+                       ; (H-L-H) Read next pixel from FLASH
+                out IO(DATA_PORT), reg_nextPixel            ; (L) Write pixel to data port
+                lpm reg_nextPixel, Z+                       ; (H-L-H) Read next pixel from FLASH
+                out IO(DATA_PORT), reg_nextPixel            ; (L) Write pixel to data port
+                lpm reg_nextPixel, Z+                       ; (H-L-H) Read next pixel from FLASH
 
-                ; Write 4 or 5 pixels and write audio sample to PWM channel:
+                nop                                         ; (L) Synchronisation delay
+                ldd reg_nextTile_h, Y+1                     ; (H-L) Read next tile pointer into register pair r21:r20 (high byte)
+                dec reg_tilesRemainingInColumn              ; (H) Decrement tile counter
+
+                ; Write 4 or 5 pixels, move tile texture pointer to Z register, and loop:
+
                 #if TILE_WIDTH == 8
-                    out IO(DATA_PORT), r23                 ; (L) Write pixel to data port
-                    lpm r23, Z+                            ; (H-L-H) Read next pixel from FLASH
+                    out IO(DATA_PORT), reg_nextPixel        ; (L) Write pixel to data port
+                    lpm reg_nextPixel, Z+                   ; (H-L-H) Read next pixel from FLASH
                 #endif
-                out IO(DATA_PORT), r23                     ; (L) Write pixel to data port
-                lpm r23, Z+                                ; (H-L-H) Read next pixel from FLASH
-                out IO(DATA_PORT), r23                     ; (L) Write pixel to data port
-                lpm r23, Z+                                ; (H-L-H) Read next pixel from FLASH
-                out IO(DATA_PORT), r23                     ; (L) Write pixel to data port
-                ld r23, Y                                  ; (H-L) Read sample from audio buffer
-                sts OCR2A, r23                             ; (H-L) Store sample to PWM channel
-                lpm r23, Z+                                ; (H-L-H) Read next pixel from FLASH
+                out IO(DATA_PORT), reg_nextPixel            ; (L) Write pixel to data port
+                lpm reg_nextPixel, Z+                       ; (H-L-H) Read next pixel from FLASH
+                out IO(DATA_PORT), reg_nextPixel            ; (L) Write pixel to data port
+                lpm reg_nextPixel, Z+                       ; (H-L-H) Read next pixel from FLASH
+                out IO(DATA_PORT), reg_nextPixel            ; (L) Write pixel to data port
 
-                ; Write 4 or 5 pixels and then re-execute pixel_loop_1 if counter is not zero:
-                #if TILE_WIDTH == 8
-                    out IO(DATA_PORT), r23                 ; (L) Write pixel to data port
-                    lpm r23, Z+                            ; (H-L-H) Read next pixel from FLASH
-                #endif
-                out IO(DATA_PORT), r23                     ; (L) Write pixel to data port
-                lpm r23, Z+                                ; (H-L-H) Read next pixel from FLASH
-                out IO(DATA_PORT), r23                     ; (L) Write pixel to data port
-                lpm r23, Z+                                ; (H-L-H) Read next pixel from FLASH
-                out IO(DATA_PORT), r23                     ; (L) Write pixel to data port
-                lpm r23, Z+                                ; (H-L-H) Read next pixel from FLASH
-                adc YH, r1                                 ; (L) Propgate carry from the Y increment several instructions above
-                dec r16                                    ; (H) Decrement pixel_loop_1 counter
-                brne pixel_loop_1                          ; (L-H / L) If counter hasn't reached zero, execute pixel_loop_1 again
-                ldi r17, 2                                 ; (H) Reset pixel_loop_2 counter
+                movw ZL, reg_nextTile_l                     ; (H) Quick move next tile pointer to Z register
+                lpm reg_nextPixel, Z+                       ; (H-L-H) Read next pixel from FLASH
+                breq endOfColumn                            ; (H / H-L) If tile counter has reached zero, end the column
+                rjmp tileLoop                               ; (L-H) Else, write the next tile
 
-                dec r16                                    ; (H) Decrement pixel_loop_1 counter
+            ;~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ Tile loop (executed 28 times) ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-                ; Write 4 or 5 pixels and then re-execute pixel_loop_1 if counter is not zero:
-                #if TILE_WIDTH == 8
-                    out IO(DATA_PORT), r23                 ; (L) Write pixel to data port
-                    lpm r23, Z+                            ; (H-L-H) Read next pixel from FLASH
-                #endif
-                out IO(DATA_PORT), r23                     ; (L) Write pixel to data port
-                lpm r23, Z+                                ; (H-L-H) Read next pixel from FLASH
-                out IO(DATA_PORT), r23                     ; (L) Write pixel to data port
-                lpm r23, Z+                                ; (H-L-H) Read next pixel from FLASH
-                out IO(DATA_PORT), r23                     ; (L) Write pixel to data port
-                sbis r16, 2
-                movw ZL, r20                               ; (H) Quick move tile pointer from register pair r21:r20 to Z register
-                lpm r23, Z+                                ; (L-H-L) Read next byte from FLASH
+        ;~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ Write all tiles in the column (as RAMWR parameters) ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-                brne pixel_loop_1                          ; (L-H / L) If counter hasn't reached zero, execute pixel_loop_1 again
-                ldi r17, 2                                 ; (H) Reset pixel_loop_2 counter
+        ;################################################ End of column ################################################
+        ; 16/15 CPU cycles
+        ; 26 bytes of FLASH
 
-            ;~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-            ; Write 4 or 5 pixels and start preparing for the next tile:
-            #if TILE_WIDTH == 8
-                out IO(DATA_PORT), r23                 ; (L) Write byte to data port
-                lpm r23, Z+                            ; (H-L-H) Read next byte from FLASH
-            #endif
-            out IO(DATA_PORT), r23                     ; (L) Write byte to data port
-            lpm r23, Z+                                ; (H-L-H) Read next byte from FLASH
-            out IO(DATA_PORT), r23                     ; (L) Write byte to data port
-            lpm r23, Z+                                ; (H-L-H) Read next byte from FLASH
-            out IO(DATA_PORT), r23                     ; (L) Write pixel to data port
-            lpm r23, Z+                                ; (H-L-H) Read next pixel from FLASH
-            ld r20, X+                                 ; (L-H) Read next tile pointer into register pair r21:r20 (low byte)
-            ld r21, X+                                 ; (L-H) Read next tile pointer into register pair r21:r20 (high byte)
-
-            ; Write 8 or 10 pixels and continue preparing for the next tile:
-        pixel_loop_2:
-            #if TILE_WIDTH == 8
-                out IO(DATA_PORT), r23                 ; (L) Write byte to data port
-                lpm r23, Z+                            ; (H-L-H) Read next byte from FLASH
-            #endif
-            out IO(DATA_PORT), r23                     ; (L) Write byte to data port
-            lpm r23, Z+                                ; (H-L-H) Read next byte from FLASH
-            out IO(DATA_PORT), r23                     ; (L) Write byte to data port
-            lpm r23, Z+                                ; (H-L-H) Read next byte from FLASH
-            out IO(DATA_PORT), r23                     ; (L) Write byte to data port
-            lpm r23, Z+                                ; (H-L-H) Read next byte from FLASH
-            ldi r16, 4                                 ; (L) Reset pixel_loop_1 counter
-            dec r17                                    ; (H) Decrement pixel_loop_2 counter
-            brne pixel_loop_2                          ; (L-H / L) If counter hasn't reached zero, execute pixel_loop_2 again
-            dec r13                                    ; (H) Decrement tile counter
-
-            ; Write 4 or 5 pixels and finish preparing for the next tile:
-            #if TILE_WIDTH == 8
-                out IO(DATA_PORT), r23                 ; (L) Write byte to data port
-                lpm r23, Z+                            ; (H-L-H) Read next byte from FLASH
-            #endif
-            out IO(DATA_PORT), r23                     ; (L) Write byte to data port
-            lpm r23, Z+                                ; (H-L-H) Read next byte from FLASH
-            out IO(DATA_PORT), r23                     ; (L) Write byte to data port
-            lpm r23, Z+                                ; (H-L-H) Read next byte from FLASH
-            out IO(DATA_PORT), r23                     ; (L) Write byte to data port
-            movw ZL, r20                               ; (H) Quick move tile pointer from register pair r21:r20 to Z register
-            lpm r23, Z+                                ; (L-H-L) Read next byte from FLASH
-            breq end_of_column                         ; (H / H-L) If tile counter has reached zero, jump out of the loop
-            rjmp write_tile                            ; (L-H) Else (the counter hasn't reached zero), go back and write the next tile
-
-        end_of_column:
+        endOfColumn:
 
             ; Disable timer
-            out IO(TCCR0B), r15                        ; (H)
+            out IO(TCCR0B), reg_timerDisable                    ; (H)
 
             ; Undo the last Z increment since we need to re-read the same pixel at the start of the next loop:
-            sbiw ZL, 1                                 ; (H-H)
+            sbiw ZL, 1                                          ; (H-H)
 
-        ;~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            ; Poll timer interrupt (must be done here to ensure the response time is less than 256 CPU cycles):
+            in reg_temporary, IO(TIFR1)                         ; (H) Read TIMER1 interrupt flag register
+            andi reg_temporary, (1 << TOV1)                     ; (H) Mask TOV1 (timer overflow) flag
+            out IO(TIFR1), reg_temporary                        ; (H) If the flag was set, clear it
+            add XL, reg_temporary                               ; (H) If the flag was set, add 1 to sample pointer (carry is propogated to high byte later)
+            adc XH, reg_zero                                    ; (H) Propogate carry to sample pointer high byte
+            ld reg_temporary, X                                 ; (H-H) Read sample from audio buffer
+            sts OCR2A, reg_temporary                            ; (H-H) Store sample to PWM channel
 
-    ;~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            ; Decrement column counter
+            dec reg_columnsRemaining                            ; (H)
 
-    ;############################## Write next column until all columns have been written ##############################
+            ; If column counter hasn't reached zero, execute the column loop again to write the next column:
+            breq endOfScreen                                    ; (H / H-H) Skip the jump column counter has reached 0
+            rjmp tileColumnLoop                                 ; (H-H) Jump back to start of column loop
 
-        ; Decrement column counter
-        dec r22                                        ; (H)
+        ;~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ End of column ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-        ; If column counter hasn't reached zero, execute the column loop again to write the next column:
-        breq no_column_loop                            ; (H / H-H) Skip the jump column counter has reached 0
-        rjmp write_tile_column                         ; (H-H) Jump back to start of column loop
-
-    no_column_loop:
-
-    ;~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    ;~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ Column loop (executed 40 or 30 times) ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
     ;#################################################### Finish up ####################################################
+    ; 30 CPU cycles
+    ; 32 bytes of FLASH
+
+    endOfScreen:
 
         ; Store updated audio sample pointer back:
-        sts currentAudioSamplePtr, YL                     ; (H)
-        sts currentAudioSamplePtr+1, YH                   ; (H)
+        sts currentAudioSamplePtr, XL                       ; (H-H)
+        sts currentAudioSamplePtr+1, XH                     ; (H-H)
 
-        ; Pull CSX line high:
-        sbi IO(CONTROL_PORT), CONTROL_PORT_CSX         ; (H-H)
+        ; Generate a negative pulse on VSYNC signal:
+        cbi IO(CONTROL_PORT), CONTROL_PORT_VSYNC            ; (H-H)
+        sbi IO(CONTROL_PORT), CONTROL_PORT_VSYNC            ; (H-H)
 
         ; Restore global interrupt flag (and others, but they don't matter):
-        out IO(SREG), r0                               ; (H)
+        out IO(SREG), reg_sregSave                          ; (H)
 
         ; Restore call-save registers that have been modified:
-        pop YH                                         ; (H-H)
-        pop YL                                         ; (H-H)
-        pop r17                                        ; (H-H)
-        pop r16                                        ; (H-H)
-        pop r15                                        ; (H-H)
-        pop r14                                        ; (H-H)
-        pop r13                                        ; (H-H)
+        pop YH                                              ; (H-H)
+        pop YL                                              ; (H-H)
+        pop r17                                             ; (H-H)
+        pop r16                                             ; (H-H)
+        pop r15                                             ; (H-H)
+        pop r14                                             ; (H-H)
+        pop r13                                             ; (H-H)
+        pop r12                                             ; (H-H)
 
         ; Return from the function:
-        ret                                            ; (H-H-H-H-H)
+        ret                                                 ; (H-H-H-H-H)
 
-    ;~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    ;~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ Finish up ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-;~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+;~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ void writeScreen(void) ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

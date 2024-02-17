@@ -123,54 +123,46 @@ void writeCommand(uint8_t command, uint8_t parameter_count, uint8_t* parameters)
 }
 
 void initialiseLcd() {
-	/* Disable JTAG in software, so that it does not interfere with Port C  */
-	/* It will be re-enabled after a power cycle if the JTAGEN fuse is set. */
+	// Disable JTAG so that it does not interfere with port C:
 	MCUCR |= (1<<JTD);
 	MCUCR |= (1<<JTD);
 
+    // Set control and data pins as outputs:
     CONTROL_DDR = 0x7F;
     DATA_DDR = 0xFF;
 
-    CONTROL_PORT = (1 << CONTROL_PORT_CSX)
+    // Start LCD reset:
+    CONTROL_PORT = (0 << CONTROL_PORT_CSX)
                  | (1 << CONTROL_PORT_D_CX)
                  | (1 << CONTROL_PORT_RDX)
                  | (1 << CONTROL_PORT_VSYNC)
                  | (1 << CONTROL_PORT_WRX);
-    _delay_ms(100);
+    _delay_us(15);
     CONTROL_PORT |= (1 << CONTROL_PORT_RESX);
-    _delay_ms(100);
-
-    // Chip-select:
-    CONTROL_PORT &= ~(1 << CONTROL_PORT_CSX);
-
-    writeCommand(COMMAND_DISPLAY_OFF,                  0, NULL);
+    _delay_ms(130);
     writeCommand(COMMAND_SLEEP_OUT,                    0, NULL);
-    // _delay_ms(60);
+    _delay_ms(10);
+
+    // Set up LCD:
     writeCommand(COMMAND_INTERNAL_IC_SETTING,          1, (uint8_t[]) { 0x01 });
     writeCommand(COMMAND_POWER_CONTROL_1,              2, (uint8_t[]) { 0x26, 0x08 });
     writeCommand(COMMAND_POWER_CONTROL_2,              1, (uint8_t[]) { 0x10 });
     writeCommand(COMMAND_VCOM_CONTROL_1,               2, (uint8_t[]) { 0x35, 0x3E });
-    writeCommand(COMMAND_MEMORY_ACCESS_CONTROL,        1, (uint8_t[]) { 0xE8 });
-    writeCommand(COMMAND_RGB_INTERFACE_SIGNAL_CONTROL, 1, (uint8_t[]) { 0x4A }); // Set the DE/HSync/VSync/DotClk polarity
-    writeCommand(COMMAND_FRAME_CONTROL_IN_NORMAL_MODE, 2, (uint8_t[]) { 0x00, 0x1B }); // 70 Hz
-    // writeCommand(COMMAND_FRAME_CONTROL_IN_NORMAL_MODE, 2, (uint8_t[]) { 0x03, 0x1f });
-    // writeCommand(COMMAND_DISPLAY_FUNCTION_CONTROL,     4, (uint8_t[]) { 0x0A, 0x82, 0x27, 0x00 });
-    writeCommand(COMMAND_DISPLAY_FUNCTION_CONTROL,     4, (uint8_t[]) { 0x02, 0x80, 0x27, 0x00 });
     writeCommand(COMMAND_VCOM_CONTROL_2,               1, (uint8_t[]) { 0xB5 });
-    // writeCommand(COMMAND_INTERFACE_CONTROL,            3, (uint8_t[]) { 0x01, 0x00, 0x08 }); // System and VSYNC interface
-    writeCommand(COMMAND_INTERFACE_CONTROL,            3, (uint8_t[]) { 0x01, 0x00, 0x00 }); // System interface
+
     writeCommand(COMMAND_GAMMA_DISABLE,                1, (uint8_t[]) { 0x00 });
     writeCommand(COMMAND_GAMMA_SET,                    1, (uint8_t[]) { 0x01 });
-    writeCommand(COMMAND_PIXEL_FORMAT_SET,             1, (uint8_t[]) { 0x55 }); // 0x66 = 18-bit/pixel, 0x55 = 16-bit/pixel
     writeCommand(COMMAND_POSITIVE_GAMMA_CORRECTION,   15, (uint8_t[]) { 0x1F, 0x1A, 0x18, 0x0A, 0x0F, 0x06, 0x45, 0x87, 0x32, 0x0A, 0x07, 0x02, 0x07, 0x05, 0x00 });
     writeCommand(COMMAND_NEGATIVE_GAMMA_CORRECTION,   15, (uint8_t[]) { 0x00, 0x25, 0x27, 0x05, 0x10, 0x09, 0x3A, 0x78, 0x4D, 0x05, 0x18, 0x0D, 0x38, 0x3A, 0x1F });
     writeCommand(COMMAND_COLUMN_ADDRESS_SET,           4, (uint8_t[]) { 0x00, 0x00, 0x01, 0x3F });
     writeCommand(COMMAND_PAGE_ADDRESS_SET,             4, (uint8_t[]) { 0x00, 0x00, 0x00, 0xEF });
-    writeCommand(COMMAND_TEARING_EFFECT_LINE_OFF,      0, NULL);
-    writeCommand(COMMAND_DISPLAY_INVERSION_CONTROL,    1, (uint8_t[]) { 0x00 });
-    writeCommand(COMMAND_ENTRY_MODE_SET,               1, (uint8_t[]) { 0x07 });
-    // writeCommand(COMMAND_COLOR_SET,                  128, ...);
-    writeCommand(COMMAND_BLANKING_PORCH_CONTROL,       4, (uint8_t[]) {0x02, 0x7F, 0x02, 0x02});
+
+    writeCommand(COMMAND_PIXEL_FORMAT_SET,             1, (uint8_t[]) { 0x55 }); // 0x66 = 18-bit/pixel, 0x55 = 16-bit/pixel
+    writeCommand(COMMAND_INTERFACE_CONTROL,            3, (uint8_t[]) { 0x01, 0x00, 0x08 }); // System and VSYNC interface
+    writeCommand(COMMAND_MEMORY_ACCESS_CONTROL,        1, (uint8_t[]) { 0x28 });
+    writeCommand(COMMAND_FRAME_CONTROL_IN_NORMAL_MODE, 2, (uint8_t[]) { 0x00, 0x1F }); // 60 Hz
+
+    // Clear screen:
     writeCommand(COMMAND_MEMORY_WRITE,                 0, NULL);
     DATA_PORT = 0x00;
     for (uint32_t i = 0; i < (uint32_t) 320 * 240; i++) {
@@ -179,19 +171,17 @@ void initialiseLcd() {
         CONTROL_PORT &= ~(1 << CONTROL_PORT_WRX);
         CONTROL_PORT |= (1 << CONTROL_PORT_WRX);
     }
+
+    // Turn the display on and enable the backlight:
     writeCommand(COMMAND_DISPLAY_ON,                   0, NULL);
     CONTROL_PORT |= (1 << CONTROL_PORT_BLC);
 
-    // Chip-deselect:
-    CONTROL_PORT |= (1 << CONTROL_PORT_CSX);
-
-    // Initialise TIMER0:
+    // Initialise TIMER0 for driving the WRX signal:
     TCCR0A = (1 << COM0A0)                // OC1A toggle on compare match
            | (1 << WGM01) | (1 << WGM00); // Fast PWM mode, TOP = OCR0A
     TCCR0B = (1 << WGM02);                // ...
-    TCNT0 = 0;
-    OCR0A = 0;
-    OCR0B = 0;
+    OCR0A = 0;                            // 6 MHz pin toggle
+    TCNT0 = 0;                            // Reset counter to zero
 
     // Make sure OC0A is in the HIGH state:
     setOc0aHigh();
@@ -202,23 +192,23 @@ void initialiseLcd() {
 }
 
 void setOc0aHigh() {
-    asm(
+    asm volatile(
         "ldi 25, 0x08" "\n"
         "ldi 24, 0x09" "\n"
 
-        // Clock the timer for one cycle:
+        // After a hardware reset it seems to take the timer a few cycles to start working properly.
+        // Enable the timer for two CPU cycles.
         "out 0x25, r24"  "\n" // enable clock
         "nop"            "\n"
         "out 0x25, r25"  "\n" // disable clock
 
-        // Give time for the pin's output to propogate to PINB:
-        "nop"            "\n"
-        "nop"            "\n"
+        // Wait for 2 CPU cycles to give time for the pin's output to propogate to PINB:
+        "rjmp .+2"       "\n"
 
-        // If PINB3 is low, enable the timer for one clock cycle to toggle it to high:
+        // If PINB3 is low, enable the timer for one CPU cycle to toggle it to high:
         "sbic 0x03, 3"   "\n" // skip if PINB3 is cleared
         "rjmp .+4"       "\n"
-        "out 0x25, 0x09" "\n" // enable clock
+        "outn0x25, 0x09" "\n" // enable clock
         "out 0x25, 0x08" "\n" // disable clock
     );
 }

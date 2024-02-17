@@ -6,9 +6,17 @@
 #include <avr/interrupt.h>
 #include <stdlib.h>
 #include <util/delay.h>
+#include <stdbool.h>
 
-#define GRID_WIDTH 40
-#define GRID_HEIGHT 28
+#if TILE_WIDTH == 6
+    #define GRID_WIDTH 40
+    #define GRID_HEIGHT 28
+#elif TILE_WIDTH == 8
+    #define GRID_WIDTH 30
+    #define GRID_HEIGHT 28
+#else
+    #error "Invalid TILE_WIDTH"
+#endif
 
 #define AUDIO_BUFFER_SIZE 524
 
@@ -35,6 +43,31 @@ uint8_t audioBuffer[AUDIO_BUFFER_SIZE] = {
 uint8_t* currentAudioSamplePtr = &audioBuffer[0];
 
 const uint8_t* vram[GRID_WIDTH * GRID_HEIGHT];
+
+volatile uint8_t vsync60Hz = 2;
+
+void ClearVsyncFlag() {
+    if (vsync60Hz != 0) {
+        vsync60Hz--;
+    }
+}
+
+bool GetVsyncFlag() {
+    return vsync60Hz > 0;
+}
+
+void WaitSync(int count) {
+    for (int i = 0; i < count; i++) {
+        while (GetVsyncFlag() == false);
+        ClearVsyncFlag();
+    }
+}
+
+void setTile(uint16_t x, uint16_t y, const uint8_t* tile) {
+    vram[x + y * GRID_WIDTH] = tile;
+}
+
+void mixAudio() { }
 
 int main() {
     initialiseLcd();
@@ -67,11 +100,22 @@ int main() {
         // vram[i] = &tileMap[8 + i % 3][0];
     }
 
-    writeScreen();
-
     sei();
 
-    while (1);
+    while (1) {
+        WaitSync(2);
+
+        static uint16_t offset = 0;
+        offset = (offset + 1) % 8;
+
+        for (uint16_t x = 0; x < GRID_WIDTH; x++) {
+            for (uint16_t y = 0; y < GRID_HEIGHT; y++) {
+                setTile(x, y, &tileMap[(y + offset) % 8][0]);
+            }
+        }
+
+        // while (1);
+    }
 }
 
 // This ISR uses 89/768 = ~12% of CPU time (when the screen isn't being updated). However it wastes 40 CPU cycles
@@ -82,14 +126,11 @@ ISR(TIMER1_OVF_vect) {
     currentAudioSamplePtr++;
     if (currentAudioSamplePtr == &audioBuffer[AUDIO_BUFFER_SIZE]) {
         currentAudioSamplePtr = &audioBuffer[0];
+        OCR2A = *currentAudioSamplePtr;
         sei();
-        // mixAudio();
+        mixAudio();
         writeScreen();
-
-        // Pulse vsync:
-        // PORTA &= ~(1 << 6);
-        // PORTA |= (1 << 6);
-
+        vsync60Hz = 2;
     } else {
         OCR2A = *currentAudioSamplePtr;
     }
